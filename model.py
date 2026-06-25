@@ -15,6 +15,7 @@ base_data_path = os.path.join(".", "data", "SpeechCommands", "speech_commands_v0
 
 if not os.path.exists(base_data_path):
     import torchaudio
+    os.makedirs("./data", exist_ok=True)
     print("Downloading raw audio files (this may take a few minutes)...")
     torchaudio.datasets.SPEECHCOMMANDS(root="./data", download=True)
 
@@ -26,6 +27,10 @@ mfcc_transform = T.MFCC(
     n_mfcc=20,
     melkwargs={"n_fft": 1024, "hop_length": 160, "n_mels": 40}
 )
+
+# Automatically use GPU if available, otherwise fall back to CPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Training on: {device}")
 
 # ========================================================
 # 2. COMPETITION PIPELINE DATASET
@@ -59,27 +64,29 @@ class AudioTrainDataset(Dataset):
         return mfcc.t(), self.targets[idx]  # Shape: [Time_Steps, 20]
 
 # ========================================================
-# 3. DEFINE VANILLA RNN MODEL
+# 3. DEFINE VANILLA RNN MODEL (BIDIRECTIONAL)
 # ========================================================
 class AudioRNN(nn.Module):
     def __init__(self, input_size=20, hidden_size=64, num_classes=3):
         super().__init__()
-        # nn.RNN processes the sequence one time-step at a time
-        # batch_first=True means input shape is [batch, time_steps, features]
-        self.rnn = nn.RNN(input_size=input_size, hidden_size=hidden_size, batch_first=True)
-        # Final linear layer maps the last hidden state to one of 3 word classes
-        self.fc = nn.Linear(hidden_size, num_classes)
+        # bidirectional=True makes the RNN read the audio forward AND backward
+        # then combines both views — the end of a word gives context about the start
+        # Side effect: output hidden size doubles to hidden_size * 2 (128)
+        self.rnn = nn.RNN(input_size=input_size, hidden_size=hidden_size, batch_first=True, bidirectional=True)
+        # Input to fc is hidden_size * 2 because bidirectional doubles the output
+        self.fc = nn.Linear(hidden_size * 2, num_classes)
 
     def forward(self, x):
-        # x shape:      [batch_size, time_steps, 20]
-        # output shape: [batch_size, time_steps, hidden_size]  (every time-step)
-        # h_n shape:    [1, batch_size, hidden_size]           (just the final step)
+        # x shape:   [batch_size, time_steps, 20]
+        # h_n shape: [2, batch_size, hidden_size]
+        #             ^-- 2 because bidirectional (forward pass + backward pass)
         output, h_n = self.rnn(x)
 
-        # We only care about the LAST time-step's hidden state
-        # (it has "seen" the whole word by that point)
-        last_hidden = h_n.squeeze(0)   # [batch_size, hidden_size]
-        return self.fc(last_hidden)    # [batch_size, 3]
+        # h_n[0] = forward direction final state
+        # h_n[1] = backward direction final state
+        # Concatenate them together so the classifier sees both
+        last_hidden = torch.cat([h_n[0], h_n[1]], dim=1)  # [batch_size, hidden_size * 2]
+        return self.fc(last_hidden)                         # [batch_size, 3]
 
 # ========================================================
 # 4. TRAINING LOOP & STABILIZATION
@@ -87,14 +94,21 @@ class AudioRNN(nn.Module):
 train_dataset = AudioTrainDataset(base_data_path, LABELS)
 train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
 
-model = AudioRNN(input_size=20, hidden_size=64, num_classes=3)
+model = AudioRNN(input_size=20, hidden_size=64, num_classes=3).to(device)  # Send model to GPU
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+# Learning rate scheduler:
+# Watches the loss after each epoch — if it hasn't improved for 3 epochs in a row,
+# it cuts the learning rate in half. Lets the model learn fast early, fine-tune later.
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='min', factor=0.5, patience=3
+)
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total model parameters: {total_params}  (limit: 50,000)")
 
-NUM_EPOCHS = 15
+NUM_EPOCHS = 20
 print("\nStarting training...")
 
 for epoch in range(NUM_EPOCHS):
@@ -104,6 +118,10 @@ for epoch in range(NUM_EPOCHS):
     total = 0
 
     for batch_mfcc, batch_labels in train_loader:
+        # Send this batch to the GPU before doing any math on it
+        batch_mfcc   = batch_mfcc.to(device)
+        batch_labels = batch_labels.to(device)
+
         # 1. Clear old gradients from the previous step
         optimizer.zero_grad()
 
@@ -130,7 +148,11 @@ for epoch in range(NUM_EPOCHS):
 
     accuracy = 100 * correct / total
     avg_loss = total_loss / len(train_loader)
-    print(f"Epoch {epoch + 1:2d}/{NUM_EPOCHS} | Loss: {avg_loss:.4f} | Accuracy: {accuracy:.1f}%")
+    current_lr = optimizer.param_groups[0]['lr']
+    print(f"Epoch {epoch + 1:2d}/{NUM_EPOCHS} | Loss: {avg_loss:.4f} | Accuracy: {accuracy:.1f}% | LR: {current_lr:.6f}")
+
+    # Hand the loss to the scheduler so it can decide whether to slow down
+    scheduler.step(avg_loss)
 
 print("Training complete!")
 
@@ -142,7 +164,7 @@ print("\nRunning inference calculations on 'student_test_features.pt'...")
 if not os.path.exists("student_test_features.pt"):
     raise FileNotFoundError("Please ensure the instructor's 'student_test_features.pt' file is in this folder!")
 
-X_evaluation = torch.load("student_test_features.pt")  # Shape: [150, Time_Steps, 20]
+X_evaluation = torch.load("student_test_features.pt").to(device)  # Shape: [150, Time_Steps, 20]
 
 # Switch model to evaluation mode (disables dropout etc. if present)
 model.eval()
